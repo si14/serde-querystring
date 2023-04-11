@@ -1,8 +1,5 @@
 #![doc = include_str!("../README.md")]
 
-use std::ops::Deref;
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use axum_core::{
     extract::FromRequestParts,
@@ -14,170 +11,41 @@ use serde_querystring::de::Error;
 
 pub use serde_querystring::de::ParseMode;
 
-/// Axum's Query extractor, modified to use serde-querystring.
-///
-/// `T` is expected to implement [`serde::Deserialize`].
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use axum::{
-///     routing::get,
-///     Router,
-/// };
-/// use serde::Deserialize;
-/// use serde_querystring_axum::QueryString;
-///
-/// #[derive(Deserialize)]
-/// struct Pagination {
-///     page: usize,
-///     per_page: usize,
-/// }
-///
-/// // This will parse query strings like `?page=2&per_page=30` into `Pagination`
-/// // structs.
-/// async fn list_things(pagination: QueryString<Pagination>) {
-///     let pagination: Pagination = pagination.0;
-///
-///     // ...
-/// }
-///
-/// let app = Router::new().route("/list_things", get(list_things));
-/// # async {
-/// # axum::Server::bind(&"".parse().unwrap()).serve(app.into_make_service()).await.unwrap();
-/// # };
-/// ```
-///
-/// If the query string cannot be parsed it will reject the request with a `422
-/// Unprocessable Entity` response.
-///
-/// To change the default error and the parsing mode, add `QueryStringConfig` to your extensions.
-///
-/// ```rust,no_run
-/// use axum::{Router, Extension, http::StatusCode};
-/// use serde_querystring_axum::{ParseMode, QueryStringConfig};
-///
-/// let app = Router::new().layer(Extension(
-///     QueryStringConfig::new(ParseMode::Brackets).ehandler(|err| {
-///         (StatusCode::BAD_REQUEST, err.to_string()) // return type should impl IntoResponse
-///     }),
-/// ));
-/// # async {
-/// # axum::Server::bind(&"".parse().unwrap()).serve(app.into_make_service()).await.unwrap();
-/// # };
-/// ```
-///
+pub trait QueryStringMode {
+    fn get_mode() -> ParseMode {
+        ParseMode::UrlEncoded
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
-pub struct QueryString<T>(pub T);
+pub struct QueryString<T: QueryStringMode>(pub T);
 
 #[async_trait]
 impl<T, S> FromRequestParts<S> for QueryString<T>
 where
-    T: DeserializeOwned,
+    T: DeserializeOwned + QueryStringMode,
     S: Send + Sync,
 {
-    type Rejection = Response;
+    type Rejection = QueryStringRejection;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let QueryStringConfig { mode, ehandler } = parts
-            .extensions
-            .get::<QueryStringConfig>()
-            .cloned()
-            .unwrap_or_default();
-
         let query = parts.uri.query().unwrap_or_default();
-        let value = serde_querystring::from_str(query, mode).map_err(|e| {
-            if let Some(ehandler) = ehandler {
-                ehandler(e)
-            } else {
-                QueryStringError::default().into_response()
-            }
-        })?;
+        let value =
+            serde_querystring::from_str(query, T::get_mode()).map_err(QueryStringRejection)?;
         Ok(QueryString(value))
     }
 }
 
-impl<T> Deref for QueryString<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-/// QueryString extractor configuration
-///
-/// ```rust,no_run
-/// use axum::{Router, Extension, http::StatusCode};
-/// use serde_querystring_axum::{ParseMode, QueryStringConfig};
-///
-/// let app = Router::new().layer(Extension(
-///     QueryStringConfig::new(ParseMode::Brackets)
-///     .ehandler(|err| {
-///         (StatusCode::BAD_REQUEST, err.to_string()) // return type should impl IntoResponse
-///     }),
-/// ));
-/// # async {
-/// # axum::Server::bind(&"".parse().unwrap()).serve(app.into_make_service()).await.unwrap();
-/// # };
-/// ```
-///
-#[derive(Clone)]
-pub struct QueryStringConfig {
-    mode: ParseMode,
-    ehandler: Option<Arc<dyn Fn(Error) -> Response + Send + Sync>>,
-}
-
-impl Default for QueryStringConfig {
-    fn default() -> Self {
-        Self {
-            mode: ParseMode::Duplicate,
-            ehandler: None,
-        }
-    }
-}
-
-impl QueryStringConfig {
-    pub fn new(mode: ParseMode) -> Self {
-        Self {
-            mode,
-            ehandler: None,
-        }
-    }
-
-    pub fn mode(mut self, mode: ParseMode) -> Self {
-        self.mode = mode;
-        self
-    }
-
-    pub fn ehandler<F, R>(mut self, ehandler: F) -> Self
-    where
-        F: Fn(Error) -> R + Send + Sync + 'static,
-        R: IntoResponse,
-    {
-        self.ehandler = Some(Arc::new(move |e| ehandler(e).into_response()));
-        self
-    }
-}
-
 #[derive(Debug)]
-struct QueryStringError {
-    status: StatusCode,
-    body: String,
-}
+pub struct QueryStringRejection(pub Error);
 
-impl Default for QueryStringError {
-    fn default() -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            body: String::from("Failed to deserialize query string"),
-        }
-    }
-}
-
-impl IntoResponse for QueryStringError {
+impl IntoResponse for QueryStringRejection {
     fn into_response(self) -> Response {
-        (self.status, self.body).into_response()
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to deserialize query string: {}", self.0),
+        )
+            .into_response()
     }
 }
 
@@ -189,7 +57,7 @@ mod tests {
         body::{Body, HttpBody},
         extract::FromRequest,
         routing::get,
-        Extension, Router,
+        Router,
     };
     use http::{Request, StatusCode};
     use serde::Deserialize;
@@ -199,7 +67,7 @@ mod tests {
 
     async fn check<T>(uri: impl AsRef<str>, value: T)
     where
-        T: DeserializeOwned + PartialEq + Debug,
+        T: DeserializeOwned + PartialEq + Debug + QueryStringMode,
     {
         let req = Request::builder().uri(uri.as_ref()).body(()).unwrap();
         assert_eq!(
@@ -215,6 +83,8 @@ mod tests {
             size: Option<u64>,
             pages: Option<Vec<u64>>,
         }
+
+        impl QueryStringMode for Pagination {}
 
         check(
             "http://example.com/test",
@@ -261,13 +131,17 @@ mod tests {
             n: Vec<i32>,
         }
 
-        async fn handler(q: QueryString<Params>) -> String {
-            format!("{}-{}", q.n.get(0).unwrap(), q.n.get(2).unwrap())
+        impl QueryStringMode for Params {
+            fn get_mode() -> ParseMode {
+                ParseMode::Brackets
+            }
         }
 
-        let app = Router::new()
-            .route("/", get(handler))
-            .layer(Extension(QueryStringConfig::new(ParseMode::Brackets)));
+        async fn handler(QueryString(params): QueryString<Params>) -> String {
+            format!("{}-{}", params.n.get(0).unwrap(), params.n.get(2).unwrap())
+        }
+
+        let app = Router::new().route("/", get(handler));
         let res = app
             .oneshot(
                 Request::builder()
@@ -291,6 +165,8 @@ mod tests {
         struct Params {
             n: i32,
         }
+
+        impl QueryStringMode for Params {}
 
         async fn handler(_: QueryString<Params>) {}
 
@@ -322,16 +198,18 @@ mod tests {
             n: i32,
         }
 
-        async fn handler(_: QueryString<Params>) {}
+        impl QueryStringMode for Params {}
 
-        let app = Router::new().route("/", get(handler)).layer(Extension(
-            QueryStringConfig::default().ehandler(|_err| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    String::from("Something went wrong"),
-                )
-            }),
-        ));
+        async fn handler(
+            x: Result<QueryString<Params>, QueryStringRejection>,
+        ) -> impl IntoResponse {
+            match x {
+                Ok(QueryString(_)) => (StatusCode::OK, ""),
+                Err(QueryStringRejection(e)) => (StatusCode::BAD_GATEWAY, "Something went wrong"),
+            }
+        }
+
+        let app = Router::new().route("/", get(handler));
 
         let res = app
             .oneshot(
